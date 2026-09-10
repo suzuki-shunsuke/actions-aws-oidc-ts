@@ -37,6 +37,15 @@ export type GetIdToken = (audience: string) => Promise<string>;
 const defaultAudience = "sts.amazonaws.com";
 
 /**
+ * The session name aws-actions/configure-aws-credentials uses.
+ *
+ * Matching it keeps CloudTrail readable and keeps working for anyone whose IAM
+ * trust policy conditions on sts:RoleSessionName. The AWS SDK would otherwise
+ * default to a name ending in a timestamp.
+ */
+const defaultRoleSessionName = "GitHubActions";
+
+/**
  * The shortest session AWS STS accepts.
  *
  * A session normally only has to outlive a few API calls, so the default is the
@@ -50,7 +59,10 @@ export type Inputs = {
   roleArn: string;
   /** It defaults to 900, the shortest session AWS STS accepts. */
   durationSeconds?: number;
-  /** It defaults to "GitHubActions". */
+  /**
+   * It defaults to "GitHubActions", which is what
+   * aws-actions/configure-aws-credentials uses.
+   */
   roleSessionName?: string;
   /** It defaults to "sts.amazonaws.com", which is what AWS STS expects. */
   audience?: string;
@@ -125,7 +137,7 @@ export const credentials = (inputs: Inputs): Credentials => {
       fromWebToken({
         roleArn: inputs.roleArn,
         webIdentityToken: webIdentityToken,
-        roleSessionName: inputs.roleSessionName,
+        roleSessionName: inputs.roleSessionName ?? defaultRoleSessionName,
         durationSeconds: inputs.durationSeconds ?? defaultDurationSeconds,
       })(options)
     );

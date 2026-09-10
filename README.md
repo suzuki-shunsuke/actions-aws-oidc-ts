@@ -68,6 +68,11 @@ external ID, a session policy or a custom STS endpoint, let your users run that
 action and use the standard AWS credential chain instead, by leaving
 `credentials` out.
 
+`roleSessionName` defaults to `GitHubActions`, which is what
+`aws-actions/configure-aws-credentials` uses, so CloudTrail stays readable and
+an IAM trust policy conditioning on `sts:RoleSessionName` keeps working. The AWS
+SDK would otherwise default to a name ending in a timestamp.
+
 `getIdToken` is there so that you can pass a stub in tests. By default the token
 is read from the GitHub Actions runtime and masked with `::add-mask::`, so it
 doesn't appear in the workflow log.
