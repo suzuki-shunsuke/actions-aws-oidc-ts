@@ -3,13 +3,16 @@
   "tasks": {
     "test": "deno test --allow-env"
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": "./main.ts",
   "publish": {
-    "include": ["LICENSE", "README.md", "main.ts"]
+    "include": [
+      "LICENSE",
+      "README.md",
+      "main.ts"
+    ]
   },
   "imports": {
-    "@aws-sdk/credential-provider-web-identity": "npm:@aws-sdk/credential-provider-web-identity@^3.972.77",
     "@std/assert": "jsr:@std/assert@^1.0.19"
   }
 }

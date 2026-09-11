@@ -7,16 +7,19 @@
  * so they stay inside the action asking for them and later steps of the job
  * can't see them.
  *
+ * Only the STS AssumeRoleWithWebIdentity API is called, and that call carries
+ * no signature because the GitHub OIDC token is what authenticates it. So the
+ * AWS SDK isn't needed, which matters in a GitHub Action: the action is bundled
+ * and every job downloads it.
+ *
  * @example
  * ```ts
- * import { KMSClient } from "@aws-sdk/client-kms";
  * import { credentials } from "@suzuki-shunsuke/actions-aws-oidc";
  *
- * const client = new KMSClient({
- *   credentials: credentials({
- *     roleArn: "arn:aws:iam::123456789012:role/example",
- *   }),
+ * const provider = credentials({
+ *   roleArn: "arn:aws:iam::123456789012:role/example",
  * });
+ * const { accessKeyId, secretAccessKey, sessionToken } = await provider();
  * ```
  *
  * The job needs the permission `id-token: write`.
@@ -25,10 +28,25 @@
  */
 
 import process from "node:process";
-import { fromWebToken } from "@aws-sdk/credential-provider-web-identity";
 
-/** An AWS credential provider, which every AWS SDK client accepts. */
-export type Credentials = ReturnType<typeof fromWebToken>;
+/** Temporary AWS credentials returned by AWS STS. */
+export type AwsCredentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  /** When the session stops working. It's 900 seconds away by default. */
+  expiration: Date;
+};
+
+/**
+ * A function returning temporary AWS credentials.
+ *
+ * Nothing happens until it's called, and every call assumes the role again, so
+ * a caller that holds on to the provider never uses a stale session.
+ * @suzuki-shunsuke/github-app-jwt-aws-kms takes one of these as its credentials
+ * input.
+ */
+export type Credentials = () => Promise<AwsCredentials>;
 
 /** A function returning a GitHub OIDC token for the given audience. */
 export type GetIdToken = (audience: string) => Promise<string>;
@@ -66,6 +84,21 @@ export type Inputs = {
   roleSessionName?: string;
   /** It defaults to "sts.amazonaws.com", which is what AWS STS expects. */
   audience?: string;
+  /**
+   * The AWS region whose STS endpoint is called.
+   *
+   * It defaults to the global endpoint sts.amazonaws.com, which works from
+   * anywhere in the aws partition. A regional endpoint is closer and keeps
+   * working when the global one doesn't.
+   */
+  region?: string;
+  /**
+   * The STS endpoint, which overrides region entirely.
+   *
+   * Set it for another partition, such as
+   * https://sts.cn-north-1.amazonaws.com.cn.
+   */
+  endpoint?: string;
   /**
    * A function returning a GitHub OIDC token.
    *
@@ -122,23 +155,92 @@ export const getIdToken: GetIdToken = async (
 };
 
 /**
- * This function returns an AWS credential provider which assumes an IAM role
- * with the GitHub OIDC token.
+ * This function reads one element out of an AWS STS XML response.
+ *
+ * STS speaks the query protocol, which answers in XML rather than JSON. The
+ * values wanted here never contain a "<", so finding the element is enough and
+ * a parser isn't.
+ */
+const element = (body: string, tag: string): string | undefined =>
+  body.match(new RegExp(`<${tag}>([^<]*)</${tag}>`))?.[1];
+
+/**
+ * This function masks a secret in the workflow log.
+ *
+ * This is the ::add-mask:: workflow command, which @actions/core's setSecret
+ * writes too. The credentials aren't printed anywhere here, but they are
+ * secrets that this process now holds, so anything that does print them should
+ * print asterisks.
+ */
+const mask = (secret: string): void => {
+  console.log(`::add-mask::${secret}`);
+};
+
+const endpointOf = (inputs: Inputs): string =>
+  inputs.endpoint ??
+    (inputs.region
+      ? `https://sts.${inputs.region}.amazonaws.com/`
+      : "https://sts.amazonaws.com/");
+
+/**
+ * This function returns a function which assumes an IAM role with the GitHub
+ * OIDC token.
  *
  * The OIDC token is read only when the credentials are actually needed, and
- * again whenever the AWS SDK finds them expired, so a token is never reused
- * past its own lifetime.
+ * again on every call, so a token is never reused past its own lifetime.
+ *
+ * AssumeRoleWithWebIdentity takes no AWS credentials and carries no signature,
+ * because the OIDC token is what authenticates the caller. So this is a plain
+ * HTTPS request.
  */
 export const credentials = (inputs: Inputs): Credentials => {
   const audience = inputs.audience ?? defaultAudience;
   const read = inputs.getIdToken ?? getIdToken;
-  return (options) =>
-    read(audience).then((webIdentityToken) =>
-      fromWebToken({
-        roleArn: inputs.roleArn,
-        webIdentityToken: webIdentityToken,
-        roleSessionName: inputs.roleSessionName ?? defaultRoleSessionName,
-        durationSeconds: inputs.durationSeconds ?? defaultDurationSeconds,
-      })(options)
-    );
+  const endpoint = endpointOf(inputs);
+
+  return async () => {
+    const webIdentityToken = await read(audience);
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        Action: "AssumeRoleWithWebIdentity",
+        Version: "2011-06-15",
+        RoleArn: inputs.roleArn,
+        RoleSessionName: inputs.roleSessionName ?? defaultRoleSessionName,
+        DurationSeconds: String(
+          inputs.durationSeconds ?? defaultDurationSeconds,
+        ),
+        WebIdentityToken: webIdentityToken,
+      }),
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      // An STS error names what went wrong, which is worth surfacing: a trust
+      // policy that doesn't allow the sub claim is the usual cause.
+      const code = element(body, "Code");
+      const message = element(body, "Message");
+      throw new Error(
+        `failed to assume ${inputs.roleArn}: ${response.status}${
+          code ? ` ${code}` : ""
+        }${message ? `: ${message}` : ""}`,
+      );
+    }
+
+    const accessKeyId = element(body, "AccessKeyId");
+    const secretAccessKey = element(body, "SecretAccessKey");
+    const sessionToken = element(body, "SessionToken");
+    const expiration = element(body, "Expiration");
+    if (!accessKeyId || !secretAccessKey || !sessionToken || !expiration) {
+      throw new Error("AWS STS returned no credentials");
+    }
+    mask(secretAccessKey);
+    mask(sessionToken);
+    return {
+      accessKeyId,
+      secretAccessKey,
+      sessionToken,
+      expiration: new Date(expiration),
+    };
+  };
 };
