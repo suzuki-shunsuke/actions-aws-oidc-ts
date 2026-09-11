@@ -1,7 +1,6 @@
 # actions-aws-oidc-ts
 
 [![JSR](https://jsr.io/badges/@suzuki-shunsuke/actions-aws-oidc)](https://jsr.io/@suzuki-shunsuke/actions-aws-oidc)
-[![License](http://img.shields.io/badge/license-mit-blue.svg?style=flat-square)](https://raw.githubusercontent.com/suzuki-shunsuke/actions-aws-oidc-ts/main/LICENSE)
 
 actions-aws-oidc-ts is a JSR package to get AWS credentials on GitHub Actions by
 assuming an IAM role with the GitHub OIDC token.
@@ -76,7 +75,3 @@ SDK would otherwise default to a name ending in a timestamp.
 `getIdToken` is there so that you can pass a stub in tests. By default the token
 is read from the GitHub Actions runtime and masked with `::add-mask::`, so it
 doesn't appear in the workflow log.
-
-## LICENSE
-
-[MIT](LICENSE)
