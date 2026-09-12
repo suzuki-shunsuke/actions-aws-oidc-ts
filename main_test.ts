@@ -148,13 +148,19 @@ const stubIdToken = (audiences: string[]): GetIdToken => (audience) => {
 
 const expiration = "2026-09-11T12:00:00Z";
 
+// These stand in for credentials without looking like any. AWS's own example
+// values trip secret scanners once the ASIA prefix of a temporary key is put in
+// front of them, and nothing here depends on the shape. The "/" is kept because
+// a real secret access key contains one, and it has to survive being read out
+// of the XML.
+
 const stsResponse = () =>
   new Response(
     `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <AssumeRoleWithWebIdentityResult>
     <Credentials>
-      <AccessKeyId>ASIAIOSFODNN7EXAMPLE</AccessKeyId>
-      <SecretAccessKey>wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</SecretAccessKey>
+      <AccessKeyId>test-access-key-id</AccessKeyId>
+      <SecretAccessKey>test/secret-access-key</SecretAccessKey>
       <SessionToken>session-token</SessionToken>
       <Expiration>${expiration}</Expiration>
     </Credentials>
@@ -186,8 +192,8 @@ Deno.test("credentials assumes the role with the OIDC token", async () => {
       })();
 
       assertEquals(got, {
-        accessKeyId: "ASIAIOSFODNN7EXAMPLE",
-        secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        accessKeyId: "test-access-key-id",
+        secretAccessKey: "test/secret-access-key",
         sessionToken: "session-token",
         expiration: new Date(expiration),
       });
@@ -219,7 +225,7 @@ Deno.test("credentials masks the secrets in the workflow log", async () => {
       await credentials({ roleArn, getIdToken: stubIdToken([]) })();
     });
     assertEquals(lines, [
-      "::add-mask::wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "::add-mask::test/secret-access-key",
       "::add-mask::session-token",
     ]);
   });
