@@ -2,16 +2,24 @@ import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import process from "node:process";
 import { credentials, type GetIdToken, getIdToken } from "./main.ts";
 
-/** This function replaces globalThis.fetch with a fake one and records requests. */
+/**
+ * This function replaces globalThis.fetch with a fake one and records requests.
+ *
+ * A response is built per call rather than shared, because a body can only be
+ * read once and a test may make more than one request.
+ */
 const withFakeFetch = async (
-  response: Response,
+  response: Response | (() => Response),
   fn: (requests: Request[]) => Promise<void>,
 ): Promise<void> => {
   const requests: Request[] = [];
   const original = globalThis.fetch;
+  const build = typeof response === "function"
+    ? response
+    : () => response.clone();
   globalThis.fetch = ((url: string | URL | Request, init?: RequestInit) => {
     requests.push(new Request(String(url), init));
-    return Promise.resolve(response);
+    return Promise.resolve(build());
   }) as typeof fetch;
   try {
     await fn(requests);
@@ -131,48 +139,206 @@ Deno.test("getIdToken fails if the response carries no token", async () => {
   });
 });
 
-Deno.test("credentials reads a token for the default audience", async () => {
+const roleArn = "arn:aws:iam::123456789012:role/example";
+
+const stubIdToken = (audiences: string[]): GetIdToken => (audience) => {
+  audiences.push(audience);
+  return Promise.resolve("id-token");
+};
+
+const expiration = "2026-09-11T12:00:00Z";
+
+const stsResponse = () =>
+  new Response(
+    `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <Credentials>
+      <AccessKeyId>ASIAIOSFODNN7EXAMPLE</AccessKeyId>
+      <SecretAccessKey>wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY</SecretAccessKey>
+      <SessionToken>session-token</SessionToken>
+      <Expiration>${expiration}</Expiration>
+    </Credentials>
+  </AssumeRoleWithWebIdentityResult>
+</AssumeRoleWithWebIdentityResponse>`,
+    { status: 200 },
+  );
+
+/** This runs fn with console.log captured, so ::add-mask:: doesn't reach the output. */
+const withQuietLog = async (fn: () => Promise<void>): Promise<string[]> => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => lines.push(args.join(" "));
+  try {
+    await fn();
+  } finally {
+    console.log = original;
+  }
+  return lines;
+};
+
+Deno.test("credentials assumes the role with the OIDC token", async () => {
   const audiences: string[] = [];
-  const stub: GetIdToken = (audience) => {
-    audiences.push(audience);
-    return Promise.resolve("id-token");
-  };
+  await withFakeFetch(stsResponse(), async (requests) => {
+    await withQuietLog(async () => {
+      const got = await credentials({
+        roleArn,
+        getIdToken: stubIdToken(audiences),
+      })();
 
-  // Whether the STS call that follows succeeds is beside the point and depends
-  // on the environment, so its outcome is ignored. What matters is that the
-  // provider read a token once it was invoked.
-  await credentials({
-    roleArn: "arn:aws:iam::123456789012:role/example",
-    getIdToken: stub,
-  })().catch(() => {});
+      assertEquals(got, {
+        accessKeyId: "ASIAIOSFODNN7EXAMPLE",
+        secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        sessionToken: "session-token",
+        expiration: new Date(expiration),
+      });
+    });
 
-  assertEquals(audiences, ["sts.amazonaws.com"]);
+    assertEquals(audiences, ["sts.amazonaws.com"]);
+    assertEquals(requests.length, 1);
+    assertEquals(requests[0].url, "https://sts.amazonaws.com/");
+    assertEquals(requests[0].method, "POST");
+
+    const body = new URLSearchParams(await requests[0].text());
+    assertEquals(body.get("Action"), "AssumeRoleWithWebIdentity");
+    assertEquals(body.get("Version"), "2011-06-15");
+    assertEquals(body.get("RoleArn"), roleArn);
+    assertEquals(body.get("WebIdentityToken"), "id-token");
+    // Defaults: the session name configure-aws-credentials uses, and the
+    // shortest session AWS STS accepts.
+    assertEquals(body.get("RoleSessionName"), "GitHubActions");
+    assertEquals(body.get("DurationSeconds"), "900");
+
+    // The call carries no signature, because the OIDC token authenticates it.
+    assertEquals(requests[0].headers.get("authorization"), null);
+  });
+});
+
+Deno.test("credentials masks the secrets in the workflow log", async () => {
+  await withFakeFetch(stsResponse(), async () => {
+    const lines = await withQuietLog(async () => {
+      await credentials({ roleArn, getIdToken: stubIdToken([]) })();
+    });
+    assertEquals(lines, [
+      "::add-mask::wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "::add-mask::session-token",
+    ]);
+  });
+});
+
+Deno.test("credentials honours the session name and the duration", async () => {
+  await withFakeFetch(stsResponse(), async (requests) => {
+    await withQuietLog(async () => {
+      await credentials({
+        roleArn,
+        roleSessionName: "example",
+        durationSeconds: 3600,
+        getIdToken: stubIdToken([]),
+      })();
+    });
+    const body = new URLSearchParams(await requests[0].text());
+    assertEquals(body.get("RoleSessionName"), "example");
+    assertEquals(body.get("DurationSeconds"), "3600");
+  });
 });
 
 Deno.test("credentials honours a custom audience", async () => {
   const audiences: string[] = [];
-  const stub: GetIdToken = (audience) => {
-    audiences.push(audience);
-    return Promise.resolve("id-token");
-  };
-
-  await credentials({
-    roleArn: "arn:aws:iam::123456789012:role/example",
-    audience: "example.com",
-    getIdToken: stub,
-  })().catch(() => {});
-
+  await withFakeFetch(stsResponse(), async () => {
+    await withQuietLog(async () => {
+      await credentials({
+        roleArn,
+        audience: "example.com",
+        getIdToken: stubIdToken(audiences),
+      })();
+    });
+  });
   assertEquals(audiences, ["example.com"]);
+});
+
+Deno.test("credentials calls the regional STS endpoint when asked", async () => {
+  await withFakeFetch(stsResponse(), async (requests) => {
+    await withQuietLog(async () => {
+      await credentials({
+        roleArn,
+        region: "ap-northeast-1",
+        getIdToken: stubIdToken([]),
+      })();
+    });
+    assertEquals(requests[0].url, "https://sts.ap-northeast-1.amazonaws.com/");
+  });
+});
+
+Deno.test("credentials lets an endpoint override the region", async () => {
+  await withFakeFetch(stsResponse(), async (requests) => {
+    await withQuietLog(async () => {
+      await credentials({
+        roleArn,
+        region: "ap-northeast-1",
+        endpoint: "https://sts.cn-north-1.amazonaws.com.cn/",
+        getIdToken: stubIdToken([]),
+      })();
+    });
+    assertEquals(requests[0].url, "https://sts.cn-north-1.amazonaws.com.cn/");
+  });
+});
+
+Deno.test("credentials reports what AWS STS rejected", async () => {
+  const body =
+    `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <Error>
+    <Code>AccessDenied</Code>
+    <Message>Not authorized to perform sts:AssumeRoleWithWebIdentity</Message>
+  </Error>
+</ErrorResponse>`;
+  await withFakeFetch(new Response(body, { status: 403 }), async () => {
+    const error = await assertRejects(() =>
+      credentials({ roleArn, getIdToken: stubIdToken([]) })()
+    );
+    assertStringIncludes((error as Error).message, roleArn);
+    assertStringIncludes((error as Error).message, "403");
+    assertStringIncludes((error as Error).message, "AccessDenied");
+    assertStringIncludes(
+      (error as Error).message,
+      "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+    );
+  });
+});
+
+Deno.test("credentials fails if the response carries no credentials", async () => {
+  await withFakeFetch(new Response("<Empty/>", { status: 200 }), async () => {
+    await assertRejects(
+      () => credentials({ roleArn, getIdToken: stubIdToken([]) })(),
+      Error,
+      "AWS STS returned no credentials",
+    );
+  });
 });
 
 Deno.test("credentials doesn't read a token until it's invoked", () => {
   let called = false;
   credentials({
-    roleArn: "arn:aws:iam::123456789012:role/example",
+    roleArn,
     getIdToken: () => {
       called = true;
       return Promise.resolve("id-token");
     },
   });
   assertEquals(called, false);
+});
+
+Deno.test("credentials assumes the role again on every call", async () => {
+  const audiences: string[] = [];
+  await withFakeFetch(stsResponse, async (requests) => {
+    await withQuietLog(async () => {
+      const provider = credentials({
+        roleArn,
+        getIdToken: stubIdToken(audiences),
+      });
+      await provider();
+      await provider();
+    });
+    // A session that has expired is never handed out, because none is held.
+    assertEquals(audiences.length, 2);
+    assertEquals(requests.length, 2);
+  });
 });
